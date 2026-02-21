@@ -8,25 +8,40 @@ import time
 import os
 
 # =====================================================
-# 🔑 [1] OpenDART API KEY 입력 위치 (여기만 수정)
+# 🔑 [1] OpenDART API KEY
 # =====================================================
-API_KEY = "여기에_본인_API_KEY"
-# 예)
-# API_KEY = "1234567890abcdef1234567890abcdef"
-
+API_KEY = "ec7a408e3c6bb5d9a35ed0df3015fa0c62b2e7ee"
 BASE_URL = "https://opendart.fss.or.kr/api"
 
+# =====================================================
+# [경로] 스크립트 위치 기준으로 고정
+# =====================================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LISTED_DIR = os.path.join(BASE_DIR, "data", "listed")
+DELISTED_DIR = os.path.join(BASE_DIR, "data", "delisted")
+
 
 # =====================================================
-# [2] 전체 법인 코드(corp_code) 다운로드
+# [2] 전체 법인 코드 다운로드
 # =====================================================
 def get_all_corp_codes():
     url = f"{BASE_URL}/corpCode.xml"
-    response = requests.get(url, params={"crtfc_key": API_KEY})
+
+    response = requests.get(
+        url,
+        params={"crtfc_key": API_KEY},
+        timeout=30
+    )
     response.raise_for_status()
 
-    zip_file = zipfile.ZipFile(io.BytesIO(response.content))
-    xml_data = zip_file.read("CORPCODE.xml")
+    # ZIP 시그니처 검사
+    if not response.content.startswith(b"PK"):
+        print("❌ CORPCODE 응답이 ZIP이 아님 (OpenDART 서버 오류)")
+        print(response.content[:300])
+        raise RuntimeError("OpenDART corpCode API 오류")
+
+    with zipfile.ZipFile(io.BytesIO(response.content)) as zip_file:
+        xml_data = zip_file.read("CORPCODE.xml")
 
     root = etree.XML(xml_data)
 
@@ -39,6 +54,8 @@ def get_all_corp_codes():
         })
 
     return pd.DataFrame(corp_list)
+
+
 
 
 # =====================================================
@@ -54,7 +71,6 @@ def classify_corp(corp_code):
     if res.get("status") != "000":
         return None
 
-    # stock_code가 없으면 상장폐지로 판단
     if not res.get("stock_code"):
         return "DELISTED"
     return "LISTED"
@@ -63,12 +79,7 @@ def classify_corp(corp_code):
 # =====================================================
 # [4] 재무제표 수집
 # =====================================================
-def get_financials(corp_code, year, fs_div="CFS"):
-    """
-    fs_div:
-      - CFS : 연결재무제표
-      - OFS : 별도재무제표
-    """
+def get_financials(corp_code, year, fs_div):
     url = f"{BASE_URL}/fnlttSinglAcntAll.json"
     res = requests.get(url, params={
         "crtfc_key": API_KEY,
@@ -83,21 +94,39 @@ def get_financials(corp_code, year, fs_div="CFS"):
 
     df = pd.DataFrame(res["list"])
     df["year"] = year
+    df["fs_div"] = fs_div
     return df
 
 
 # =====================================================
-# [5] 전체 실행 로직
+# [5] 실행 로직
 # =====================================================
-def run(start_year=2012, end_year=2024):
-    os.makedirs("data/listed", exist_ok=True)
-    os.makedirs("data/delisted", exist_ok=True)
+def run(start_year=2020, end_year=2022):
+    os.makedirs(LISTED_DIR, exist_ok=True)
+    os.makedirs(DELISTED_DIR, exist_ok=True)
 
-    corp_df = get_all_corp_codes()
+    corp_code_cache = os.path.join(BASE_DIR, "corp_codes.csv")
 
-    for _, row in tqdm(corp_df.iterrows(), total=len(corp_df)):
+    if os.path.exists(corp_code_cache):
+        print("✅ corp_codes.csv 캐시 사용")
+        corp_df = pd.read_csv(corp_code_cache)
+    else:
+        print("⬇️ OpenDART에서 corpCode 다운로드 중...")
+        corp_df = get_all_corp_codes()
+        corp_df.to_csv(corp_code_cache, index=False)
+        
+        
+    corp_df = corp_df[corp_df["stock_code"].notna()]
+    print(f"📌 상장사 필터링 후 기업 수: {len(corp_df)}")
+
+
+    # ▶ 속도 개선 원하면 주석 해제 (상장사만)
+    # corp_df = corp_df[corp_df["stock_code"].notna()]
+
+    for _, row in tqdm(corp_df.iterrows(), total=len(corp_df), desc="기업 처리"):
         corp_code = row["corp_code"]
-        corp_name = row["corp_name"].replace("/", "_")
+        corp_name = row["corp_name"].replace("/", "_").replace(" ", "")
+        file_name = f"{corp_name}_{corp_code}.csv"
 
         status = classify_corp(corp_code)
         if status is None:
@@ -106,28 +135,31 @@ def run(start_year=2012, end_year=2024):
         yearly_data = []
 
         for year in range(start_year, end_year + 1):
-            df = get_financials(corp_code, year)
+            # 1️⃣ 연결재무제표 시도
+            df = get_financials(corp_code, year, "CFS")
+
+            # 2️⃣ 없으면 별도재무제표 시도
+            if df is None:
+                df = get_financials(corp_code, year, "OFS")
+
             if df is not None:
                 yearly_data.append(df)
 
-            # OpenDART 호출 제한 보호
-            time.sleep(0.2)
+            time.sleep(0.2)  # API 보호
 
         if not yearly_data:
             continue
 
         final_df = pd.concat(yearly_data, ignore_index=True)
 
-        save_dir = "listed" if status == "LISTED" else "delisted"
-        final_df.to_csv(
-            f"data/{save_dir}/{corp_name}.csv",
-            index=False,
-            encoding="utf-8-sig"
-        )
+        save_dir = LISTED_DIR if status == "LISTED" else DELISTED_DIR
+        save_path = os.path.join(save_dir, file_name)
+
+        final_df.to_csv(save_path, index=False, encoding="utf-8-sig")
 
 
 # =====================================================
-# [6] 실행 엔트리 포인트
+# [6] 엔트리 포인트
 # =====================================================
 if __name__ == "__main__":
-    run(start_year=2012, end_year=2024)
+    run(start_year=2020, end_year=2022)
